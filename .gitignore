@@ -1,0 +1,21 @@
+# Build outputs
+**/target/
+**/.mvn/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Logs
+*.log
+
+# Environment
+.env
+*.env
+
+# OS
+.DS_Store
+
+# Claude Code project instructions
+CLAUDE.md
