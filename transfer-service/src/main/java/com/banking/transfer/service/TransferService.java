@@ -16,6 +16,7 @@ import com.banking.transfer.repository.TransferRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -28,20 +29,34 @@ public class TransferService {
 
     private final TransferRepository transferRepository;
     private final IdempotencyRepository idempotencyRepository;
+    private final IdempotencyService idempotencyService;
     private final OutboxEventRepository outboxEventRepository;
     private final TransferMapper transferMapper;
     private final AccountClient accountClient;
     private final FraudClient fraudClient;
-    private final ObjectMapper objectMapper = new ObjectMapper()
-            .findAndRegisterModules();
+    private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
 
     @Transactional
     public TransferResponse executeTransfer(UUID idempotencyKey, CreateTransferRequest request) {
+        // Tamamlanmış mı?
+        IdempotencyRecord existing = idempotencyRepository.findById(idempotencyKey).orElse(null);
+        if (existing != null) {
+            if (existing.isCompleted()) {
+                return deserialize(existing.getResponse());
+            }
+            // Key var ama response null — başka bir istek işliyor
+            throw new IllegalStateException("Transfer with this idempotency key is already in progress");
+        }
 
-        // Daha önce işlendi mi?
-        return idempotencyRepository.findById(idempotencyKey)
-                .map(record -> deserialize(record.getResponse()))
-                .orElseGet(() -> processAndSave(idempotencyKey, request));
+        // DB unique constraint'i mutex olarak kullan
+        // REQUIRES_NEW → hemen commit olur → diğer eşzamanlı istek DataIntegrityViolationException alır
+        try {
+            idempotencyService.claim(idempotencyKey);
+        } catch (DataIntegrityViolationException e) {
+            throw new IllegalStateException("Transfer with this idempotency key is already in progress");
+        }
+
+        return processAndSave(idempotencyKey, request);
     }
 
     private TransferResponse processAndSave(UUID idempotencyKey, CreateTransferRequest request) {
@@ -59,7 +74,9 @@ public class TransferService {
             transfer.setStatus(TransferStatus.FAILED);
             transferRepository.save(transfer);
             log.warn("Transfer {} rejected by fraud service: {}", transfer.getId(), fraudResult.getReason());
-            return transferMapper.toResponse(transfer);
+            TransferResponse response = transferMapper.toResponse(transfer);
+            completeIdempotencyRecord(idempotencyKey, response);
+            return response;
         }
 
         boolean debitDone = false;
@@ -88,7 +105,9 @@ public class TransferService {
         }
 
         TransferResponse response = transferMapper.toResponse(transfer);
-        idempotencyRepository.save(new IdempotencyRecord(idempotencyKey, serialize(response)));
+
+        // Idempotency ve Outbox aynı transaction'da — ya ikisi commit olur ya ikisi rollback
+        completeIdempotencyRecord(idempotencyKey, response);
 
         OutboxEventType eventType = switch (transfer.getStatus()) {
             case COMPLETED -> OutboxEventType.TRANSFER_COMPLETED;
@@ -99,6 +118,12 @@ public class TransferService {
         outboxEventRepository.save(new OutboxEvent(transfer.getId(), eventType, serialize(response)));
 
         return response;
+    }
+
+    private void completeIdempotencyRecord(UUID idempotencyKey, TransferResponse response) {
+        IdempotencyRecord record = idempotencyRepository.findById(idempotencyKey).orElseThrow();
+        record.complete(serialize(response));
+        idempotencyRepository.save(record);
     }
 
     private String serialize(TransferResponse response) {

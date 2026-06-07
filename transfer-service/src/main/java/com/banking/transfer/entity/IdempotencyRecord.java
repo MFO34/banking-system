@@ -16,15 +16,22 @@ public class IdempotencyRecord {
     @Id
     private UUID idempotencyKey;
 
-    @Column(nullable = false, columnDefinition = "TEXT")
+    @Column(columnDefinition = "TEXT")
     private String response;
 
     @Column(nullable = false)
     private LocalDateTime createdAt;
 
-    public IdempotencyRecord(UUID idempotencyKey, String response) {
+    public IdempotencyRecord(UUID idempotencyKey) {
         this.idempotencyKey = idempotencyKey;
-        this.response = response;
         this.createdAt = LocalDateTime.now();
+    }
+
+    public void complete(String response) {
+        this.response = response;
+    }
+
+    public boolean isCompleted() {
+        return response != null;
     }
 }
